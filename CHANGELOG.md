@@ -11,6 +11,13 @@
 
 ### Fixed
 
+- **`account switch --cli` no longer moves MCP sign-ins with the account.**
+  The switch moved Claude Code's whole credential, so the MCP servers' OAuth
+  sign-ins (`mcpOAuth`) and other machine-wide state followed the outgoing
+  account into its saved slot, and the incoming account started without them.
+  It now moves only the keys Claude Code's own `/login` replaces: the login
+  (`claudeAiOauth`) and the grants tied to it. Everything else stays in the
+  default slot, on macOS as well as Linux and Windows.
 - **ai-usagebar no longer races Claude Code to refresh the same Claude
   login.** Both rotate the same refresh token, so when both refreshed at once
   one of them spent a token the other had already replaced, and whichever

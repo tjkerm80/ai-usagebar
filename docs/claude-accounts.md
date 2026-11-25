@@ -223,6 +223,14 @@ two places. On Linux and Windows an account's own slot is the
 `.credentials.json` in its directory, the file `CLAUDE_CONFIG_DIR=<dir> claude`
 uses.
 
+Only the account's own keys of the credential move: the login
+(`claudeAiOauth`) and the grants Claude Code ties to it, such as
+`organizationUuid` and `designOauth`. These are the keys Claude Code's own
+`/login` removes before it saves a new login. Everything else in the default
+slot stays there, including the MCP servers' sign-ins (`mcpOAuth`), the same
+as across a `/login`. When a saved account's slot holds MCP sign-ins of its
+own, the ones the default slot lacks are added to it.
+
 Running `claude` sessions follow the switch: Claude Code reloads its credential
 when the default slot changes, the same way it picks up a `/login` from another
 session. The switch holds Claude Code's token refresh lock

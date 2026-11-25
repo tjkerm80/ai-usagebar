@@ -15,6 +15,13 @@
 //! that single default slot. A running `claude` reloads its credential when
 //! the file's modification time changes, so open sessions follow the switch.
 //!
+//! Only the account's own keys of the credential blob move: the login,
+//! `claudeAiOauth`, and the few grants Claude Code ties to it
+//! ([`ACCOUNT_KEYS`]). Claude Code keeps other state in the same blob, such
+//! as the OAuth sign-ins of MCP servers under `mcpOAuth`. Its `/login` keeps
+//! that state when it replaces the account, so the switch leaves it in the
+//! default slot too.
+//!
 //! Copying would leave both slots holding the same *rotating* refresh token,
 //! and whichever client refreshed first would invalidate the other — the
 //! failure [`crate::anthropic::creds`] documents. The switch therefore moves
@@ -45,6 +52,30 @@ use crate::error::{AppError, Result};
 /// The `claude` CLI's per-config-dir state file. Holds a plaintext
 /// `oauthAccount` identity marker (uuid, email, org) — never a token.
 const CLAUDE_JSON: &str = ".claude.json";
+
+/// The key of a credential blob that holds the Claude login. A slot holds a
+/// login exactly when its blob has this key.
+const LOGIN_KEY: &str = "claudeAiOauth";
+
+/// The keys of a credential blob that belong to the signed-in account and
+/// move with its login. They are the keys Claude Code's `/login` removes from
+/// the blob before it saves a new login (its `uoo` in 2.1.332); every other
+/// key, such as `mcpOAuth`, survives a `/login` and so stays in the default
+/// slot here too.
+const ACCOUNT_KEYS: [&str; 12] = [
+    LOGIN_KEY,
+    "organizationUuid",
+    "trustedDeviceToken",
+    "trustedDeviceEnrolledAfterRefusalAtMs",
+    "enterpriseGateway",
+    "designOauth",
+    "chatHistoryOauth",
+    "cloudSessionsOauth",
+    "cloudSessionsSignInEnded",
+    "hybridOauth",
+    "hybridGatewayAuth",
+    "hybridGatewayIdp",
+];
 
 /// Read/write access to the credential slots: [`KeychainStore`] on macOS,
 /// [`FileStore`] elsewhere. Use [`platform_store`] to get the right one.
@@ -264,17 +295,27 @@ pub fn switch_cli_account(
     // first write. An empty default slot is safe to populate without --force;
     // an unrecognised *existing* login is the destructive case.
     let original_default = store.read_default()?;
-    if active.as_deref() == Some(label) && original_default.is_some() {
-        if store.read_named(&target.config_dir())?.is_none() {
+    let default_account = match original_default.as_deref() {
+        Some(blob) => account_state_in(blob)?,
+        None => Map::new(),
+    };
+    let default_signed_in = default_account.contains_key(LOGIN_KEY);
+    if active.as_deref() == Some(label) && default_signed_in {
+        let Some(duplicate) = store.read_named(&target.config_dir())? else {
             return Ok(CliSwitchOutcome::AlreadyActive);
-        }
+        };
         if opts.dry_run {
             return Ok(CliSwitchOutcome::WouldRemoveDuplicate);
         }
+        // The default slot keeps its own login; only state the duplicate has
+        // and the default lacks is carried over before the copy goes.
+        let mut kept = parse_blob(original_default.as_deref().unwrap_or("{}"))?;
+        carry_state(&mut kept, parse_blob(&duplicate)?);
+        store.write_default(&serialize_blob(kept)?)?;
         store.delete_named(&target.config_dir())?;
         return Ok(CliSwitchOutcome::RemovedDuplicate);
     }
-    if active.is_none() && original_default.is_some() && !opts.force {
+    if active.is_none() && default_signed_in && !opts.force {
         return Err(AppError::Credentials(format!(
             "the `claude` CLI is signed into an account that is not managed here, so \
              switching to {label:?} would overwrite a login that cannot be saved first. \
@@ -284,12 +325,19 @@ pub fn switch_cli_account(
     }
 
     // Fail before touching anything if the target has never been signed in.
-    let target_blob = store.read_named(&target.config_dir())?.ok_or_else(|| {
+    let never_signed_in = || {
         AppError::Credentials(format!(
             "no stored credential for {label:?}; sign it in once with \
              `ai-usagebar account add {label}`"
         ))
-    })?;
+    };
+    let target_blob = store
+        .read_named(&target.config_dir())?
+        .ok_or_else(never_signed_in)?;
+    let target_account = account_state_in(&target_blob)?;
+    if !target_account.contains_key(LOGIN_KEY) {
+        return Err(never_signed_in());
+    }
     let oauth_account =
         oauth_account_in(&target.config_dir().join(CLAUDE_JSON)).ok_or_else(|| {
             AppError::Credentials(format!(
@@ -308,6 +356,21 @@ pub fn switch_cli_account(
         None => None,
     };
 
+    // What each slot will hold, computed before the first write so a blob
+    // that does not parse stops the switch while nothing has changed.
+    let captured_outgoing = match outgoing_account {
+        Some(_) if default_signed_in => {
+            let mut captured = parse_blob(original_outgoing_named.as_deref().unwrap_or("{}"))?;
+            replace_account_state(&mut captured, default_account);
+            Some(serialize_blob(captured)?)
+        }
+        _ => None,
+    };
+    let mut installed_default = parse_blob(original_default.as_deref().unwrap_or("{}"))?;
+    replace_account_state(&mut installed_default, target_account);
+    carry_state(&mut installed_default, parse_blob(&target_blob)?);
+    let installed_default = serialize_blob(installed_default)?;
+
     if opts.dry_run {
         return Ok(CliSwitchOutcome::WouldSwitch { outgoing: active });
     }
@@ -322,12 +385,12 @@ pub fn switch_cli_account(
         original_marker: original_marker.as_deref(),
     };
 
-    if let (Some(account), Some(blob)) = (outgoing_account, original_default.as_deref())
+    if let (Some(account), Some(blob)) = (outgoing_account, captured_outgoing.as_deref())
         && let Err(error) = store.write_named(&account.config_dir(), blob)
     {
         return Err(with_rollback(error, rollback_switch(store, &rollback)));
     }
-    if let Err(error) = store.write_default(&target_blob) {
+    if let Err(error) = store.write_default(&installed_default) {
         return Err(with_rollback(error, rollback_switch(store, &rollback)));
     }
 
@@ -398,7 +461,11 @@ pub fn adopt_current(
             account.label
         )));
     }
-    if store.read_default()?.is_none() {
+    let default_signed_in = match store.read_default()? {
+        Some(blob) => account_state_in(&blob)?.contains_key(LOGIN_KEY),
+        None => false,
+    };
+    if !default_signed_in {
         return Err(AppError::Credentials(
             "the default `claude` credential slot is empty; run `claude` to sign in first".into(),
         ));
@@ -407,6 +474,65 @@ pub fn adopt_current(
     let existing = read_optional(&marker)?;
     let merged = merge_oauth_account(existing.as_deref().unwrap_or_default(), Some(&live))?;
     crate::cache::atomic_write(&marker, &merged)
+}
+
+/// A credential blob as a JSON object.
+fn parse_blob(blob: &str) -> Result<Map<String, Value>> {
+    match serde_json::from_str(blob) {
+        Ok(Value::Object(object)) => Ok(object),
+        _ => Err(AppError::Credentials(
+            "a stored `claude` credential is not a JSON object, so its login cannot be moved \
+             without discarding the rest of it"
+                .into(),
+        )),
+    }
+}
+
+fn serialize_blob(object: Map<String, Value>) -> Result<String> {
+    Ok(serde_json::to_string(&Value::Object(object))?)
+}
+
+/// The [`ACCOUNT_KEYS`] a blob holds.
+fn account_state_in(blob: &str) -> Result<Map<String, Value>> {
+    let mut object = parse_blob(blob)?;
+    Ok(ACCOUNT_KEYS
+        .iter()
+        .filter_map(|key| object.remove_entry(*key))
+        .collect())
+}
+
+/// Replace the [`ACCOUNT_KEYS`] of `object` with `account`. This is what
+/// Claude Code's `/login` saves, `{...uoo(blob), claudeAiOauth}`, except that
+/// the account's other keys come along instead of being dropped.
+fn replace_account_state(object: &mut Map<String, Value>, account: Map<String, Value>) {
+    for key in ACCOUNT_KEYS {
+        object.remove(key);
+    }
+    object.extend(account);
+}
+
+/// Copy the non-account state of `from` into `into` without overwriting any of
+/// `into`'s own: a key `into` lacks is copied whole, and an object both have
+/// gains only the entries `into` lacks. Used before a named slot is emptied,
+/// so state kept there, such as MCP sign-ins made under its
+/// `CLAUDE_CONFIG_DIR`, is not lost with it.
+fn carry_state(into: &mut Map<String, Value>, from: Map<String, Value>) {
+    for (key, value) in from {
+        if ACCOUNT_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        match (into.get_mut(&key), value) {
+            (None, value) => {
+                into.insert(key, value);
+            }
+            (Some(Value::Object(existing)), Value::Object(entries)) => {
+                for (entry_key, entry) in entries {
+                    existing.entry(entry_key).or_insert(entry);
+                }
+            }
+            (Some(_), _) => {}
+        }
+    }
 }
 
 struct RollbackState<'a> {
@@ -623,6 +749,11 @@ mod tests {
         }
     }
 
+    /// A credential blob holding a login whose access token is `name`.
+    fn login(name: &str) -> String {
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"{name}"}}}}"#)
+    }
+
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
@@ -666,15 +797,15 @@ mod tests {
         );
 
         let store = FakeStore::default();
-        *store.default.borrow_mut() = Some("personal-live".into());
+        *store.default.borrow_mut() = Some(login("personal-live"));
         store
             .named
             .borrow_mut()
-            .insert(accounts[0].config_dir(), "work-saved".into());
+            .insert(accounts[0].config_dir(), login("work-saved"));
         store
             .named
             .borrow_mut()
-            .insert(accounts[1].config_dir(), "personal-stale".into());
+            .insert(accounts[1].config_dir(), login("personal-stale"));
 
         Fixture {
             _root: root,
@@ -720,7 +851,7 @@ mod tests {
         assert_eq!(f.store.read_named(&main.config_dir()).unwrap(), None);
         assert_eq!(
             f.store.read_default().unwrap().as_deref(),
-            Some("personal-live")
+            Some(login("personal-live").as_str())
         );
     }
 
@@ -786,9 +917,12 @@ mod tests {
         // the default slot was overwritten.
         assert_eq!(
             f.store.named.borrow()[&f.accounts[1].config_dir()],
-            "personal-live"
+            login("personal-live")
         );
-        assert_eq!(f.store.default.borrow().as_deref(), Some("work-saved"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("work-saved").as_str())
+        );
         assert!(
             !f.store
                 .named
@@ -821,9 +955,26 @@ mod tests {
             .unwrap()
             .join(".claude")
             .join(".credentials.json");
-        write(&default_path, "personal-live");
-        write(&f.accounts[0].credentials_path, "work-saved");
+        // The account's own keys move with its login; the MCP sign-ins and a
+        // key this code does not know stay behind, as they do across a
+        // `/login` in Claude Code.
+        write(
+            &default_path,
+            r#"{"claudeAiOauth":{"accessToken":"personal-live"},"organizationUuid":"personal-org",
+                "designOauth":{"accessToken":"personal-design"},
+                "mcpOAuth":{"linear":{"accessToken":"live-linear"}},"futureKey":1}"#,
+        );
+        // A named slot saved before only the account keys moved still holds
+        // its own MCP sign-ins; the ones the default lacks are kept.
+        write(
+            &f.accounts[0].credentials_path,
+            r#"{"claudeAiOauth":{"accessToken":"work-saved"},"organizationUuid":"work-org",
+                "mcpOAuth":{"linear":{"accessToken":"old-linear"},"jira":{"accessToken":"jira"}}}"#,
+        );
         let store = FileStore::at(default_path.clone());
+        let read_json = |path: &Path| -> Value {
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
 
         let outcome = switch_cli_account(
             &f.home,
@@ -841,12 +992,24 @@ mod tests {
             }
         );
         assert_eq!(
-            std::fs::read_to_string(&default_path).unwrap(),
-            "work-saved"
+            read_json(&default_path),
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "work-saved"},
+                "organizationUuid": "work-org",
+                "mcpOAuth": {
+                    "linear": {"accessToken": "live-linear"},
+                    "jira": {"accessToken": "jira"},
+                },
+                "futureKey": 1,
+            })
         );
         assert_eq!(
-            std::fs::read_to_string(&f.accounts[1].credentials_path).unwrap(),
-            "personal-live"
+            read_json(&f.accounts[1].credentials_path),
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "personal-live"},
+                "organizationUuid": "personal-org",
+                "designOauth": {"accessToken": "personal-design"},
+            })
         );
         assert!(!f.accounts[0].credentials_path.exists());
         assert!(
@@ -892,7 +1055,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, CliSwitchOutcome::RemovedDuplicate);
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
         assert!(
             !f.store
                 .named
@@ -926,7 +1092,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, CliSwitchOutcome::RepairedActive);
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-stale"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-stale").as_str())
+        );
         assert!(
             !f.store
                 .named
@@ -958,7 +1127,10 @@ mod tests {
                 outgoing: Some("personal".into())
             }
         );
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
         assert_eq!(std::fs::read(&f.home).unwrap(), before);
     }
 
@@ -976,7 +1148,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--force"), "{error}");
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
 
         switch_cli_account(
             &f.home,
@@ -989,7 +1164,10 @@ mod tests {
             &f.store,
         )
         .unwrap();
-        assert_eq!(f.store.default.borrow().as_deref(), Some("work-saved"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("work-saved").as_str())
+        );
         assert!(
             !f.store
                 .named
@@ -1001,7 +1179,9 @@ mod tests {
     #[test]
     fn an_empty_default_slot_does_not_require_force() {
         let f = fixture();
-        *f.store.default.borrow_mut() = None;
+        // MCP sign-ins without a login are not a login to lose.
+        *f.store.default.borrow_mut() =
+            Some(r#"{"mcpOAuth":{"linear":{"accessToken":"linear"}}}"#.into());
         std::fs::remove_file(&f.home).unwrap();
 
         switch_cli_account(
@@ -1013,7 +1193,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(f.store.default.borrow().as_deref(), Some("work-saved"));
+        let installed: Value =
+            serde_json::from_str(f.store.default.borrow().as_deref().unwrap()).unwrap();
+        assert_eq!(
+            installed,
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "work-saved"},
+                "mcpOAuth": {"linear": {"accessToken": "linear"}},
+            })
+        );
         assert_eq!(
             resolve_active_label(&f.home, &f.accounts).as_deref(),
             Some("work")
@@ -1036,7 +1224,10 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("identity marker"), "{error}");
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
         assert_eq!(std::fs::read(&f.home).unwrap(), before);
     }
 
@@ -1059,14 +1250,17 @@ mod tests {
             error.to_string().contains("injected delete failure"),
             "{error}"
         );
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
         assert_eq!(
             f.store.named.borrow()[&f.accounts[0].config_dir()],
-            "work-saved"
+            login("work-saved")
         );
         assert_eq!(
             f.store.named.borrow()[&f.accounts[1].config_dir()],
-            "personal-stale"
+            login("personal-stale")
         );
         assert_eq!(std::fs::read(&f.home).unwrap(), before_marker);
     }
@@ -1088,7 +1282,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("account add work"), "{error}");
-        assert_eq!(f.store.default.borrow().as_deref(), Some("personal-live"));
+        assert_eq!(
+            f.store.default.borrow().as_deref(),
+            Some(login("personal-live").as_str())
+        );
     }
 
     #[test]
