@@ -11,6 +11,13 @@
 
 ### Fixed
 
+- **Two Claude accounts that share one login in different organizations are
+  told apart.** One Claude user can belong to several organizations, and each
+  can be its own named account. The active account was matched by account
+  UUID alone, so `account status` marked the first such label active whichever
+  organization `claude` was signed into, and the label that was really active
+  read its own empty credential slot and showed `⚠`. The match now compares
+  the organization too.
 - **`account switch --cli` no longer moves MCP sign-ins with the account.**
   The switch moved Claude Code's whole credential, so the MCP servers' OAuth
   sign-ins (`mcpOAuth`) and other machine-wide state followed the outgoing

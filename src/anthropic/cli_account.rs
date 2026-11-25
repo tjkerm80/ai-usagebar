@@ -173,6 +173,65 @@ pub fn account_email_in(claude_json: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Who a `.claude.json` marker says is signed in: the account, and the
+/// organization it signed in under. One Claude account can belong to several
+/// organizations, each with its own plan and quota, and each signed in as its
+/// own label — so the account UUID alone cannot tell those labels apart.
+#[derive(Debug, PartialEq, Eq)]
+struct LoginIdentity {
+    account_uuid: String,
+    organization_uuid: Option<String>,
+}
+
+impl LoginIdentity {
+    fn from_oauth_account(oauth_account: &Value) -> Option<Self> {
+        let field = |key: &str| {
+            oauth_account
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        Some(Self {
+            account_uuid: field("accountUuid")?,
+            organization_uuid: field("organizationUuid"),
+        })
+    }
+
+    fn in_marker(claude_json: &Path) -> Option<Self> {
+        Self::from_oauth_account(&oauth_account_in(claude_json)?)
+    }
+
+    /// Same account, and the same organization unless one marker does not
+    /// record one.
+    fn may_be(&self, other: &Self) -> bool {
+        self.account_uuid == other.account_uuid
+            && match (&self.organization_uuid, &other.organization_uuid) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => true,
+            }
+    }
+
+    /// The account that holds this login: the one whose marker records the
+    /// same account and organization, else the first that may be it because
+    /// a marker lacks the organization.
+    fn owner<'a>(
+        &self,
+        mut accounts: impl Iterator<Item = &'a AnthropicAccount> + Clone,
+    ) -> Option<&'a AnthropicAccount> {
+        let marker_of =
+            |account: &AnthropicAccount| Self::in_marker(&marker_path(&account.config_dir()));
+        accounts
+            .clone()
+            .find(|account| marker_of(account).as_ref() == Some(self))
+            .or_else(|| {
+                accounts.find(|account| {
+                    marker_of(account).is_some_and(|identity| identity.may_be(self))
+                })
+            })
+    }
+}
+
 /// Which managed label the live CLI login belongs to.
 ///
 /// `None` when the CLI is signed into something we do not manage — a plain
@@ -183,12 +242,8 @@ pub fn resolve_active_label(
     home_claude_json: &Path,
     accounts: &[AnthropicAccount],
 ) -> Option<String> {
-    let live = account_uuid_in(home_claude_json)?;
-    accounts
-        .iter()
-        .find(|account| {
-            account_uuid_in(&account.config_dir().join(CLAUDE_JSON)) == Some(live.clone())
-        })
+    LoginIdentity::in_marker(home_claude_json)?
+        .owner(accounts.iter())
         .map(|account| account.label.clone())
 }
 
@@ -437,18 +492,12 @@ pub fn adopt_current(
                 .into(),
         )
     })?;
-    let live_uuid = live
-        .get("accountUuid")
-        .and_then(Value::as_str)
-        .filter(|uuid| !uuid.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            AppError::Credentials("the live `claude` login records no account uuid".into())
-        })?;
-    if let Some(owner) = accounts.iter().find(|other| {
-        other.label != account.label
-            && account_uuid_in(&marker_path(&other.config_dir())).as_deref() == Some(&live_uuid)
-    }) {
+    let live_identity = LoginIdentity::from_oauth_account(&live).ok_or_else(|| {
+        AppError::Credentials("the live `claude` login records no account uuid".into())
+    })?;
+    if let Some(owner) =
+        live_identity.owner(accounts.iter().filter(|other| other.label != account.label))
+    {
         return Err(AppError::Credentials(format!(
             "the live `claude` login already belongs to account {:?}",
             owner.label
@@ -852,6 +901,43 @@ mod tests {
         assert_eq!(
             f.store.read_default().unwrap().as_deref(),
             Some(login("personal-live").as_str())
+        );
+    }
+
+    /// One Claude account in two organizations is two labels with the same
+    /// account UUID; only the organization tells which one is live, whatever
+    /// order the labels are listed in. A marker that records no organization
+    /// still matches on the account alone.
+    #[test]
+    fn the_live_organization_picks_between_labels_of_one_account() {
+        let f = fixture();
+        let in_organization = |uuid: &str, organization: &str| {
+            format!(
+                r#"{{"oauthAccount":{{"accountUuid":"{uuid}","organizationUuid":"{organization}"}}}}"#
+            )
+        };
+        write(&f.home, &in_organization("uuid-shared", "org-second"));
+        for (account, organization) in f.accounts.iter().zip(["org-first", "org-second"]) {
+            write(
+                &account.config_dir().join(CLAUDE_JSON),
+                &in_organization("uuid-shared", organization),
+            );
+        }
+        let reversed: Vec<AnthropicAccount> = f.accounts.iter().rev().cloned().collect();
+        for accounts in [&f.accounts, &reversed] {
+            assert_eq!(
+                resolve_active_label(&f.home, accounts).as_deref(),
+                Some("personal")
+            );
+        }
+
+        write(&f.home, &in_organization("uuid-shared", "org-third"));
+        assert_eq!(resolve_active_label(&f.home, &f.accounts), None);
+
+        write(&f.home, &marker("uuid-shared", "me@shared.test"));
+        assert_eq!(
+            resolve_active_label(&f.home, &f.accounts).as_deref(),
+            Some("work")
         );
     }
 
