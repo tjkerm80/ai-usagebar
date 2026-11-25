@@ -101,6 +101,9 @@ impl OauthCreds {
     }
 }
 
+/// The file name Claude Code keeps its login in, inside its config directory.
+pub const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
+
 /// Default location: `~/.claude/.credentials.json` (Unix/macOS) or
 /// `%USERPROFILE%\.claude\.credentials.json` (Windows).
 ///
@@ -109,7 +112,7 @@ impl OauthCreds {
 pub fn default_path() -> Result<PathBuf> {
     Ok(crate::cache::home_dir()?
         .join(".claude")
-        .join(".credentials.json"))
+        .join(CREDENTIALS_FILE_NAME))
 }
 
 /// Strict file read: no Keychain fallback, ever. Explicit paths (`--creds-path`,
@@ -178,6 +181,23 @@ impl CredsTarget {
             CredsTarget::Desktop(_) => return None,
         };
         (!dir.as_os_str().is_empty()).then_some(dir)
+    }
+
+    /// The directory Claude Code itself refreshes this login from, where its
+    /// token refresh lock lives ([`super::refresh_lock`]). An explicit path
+    /// counts only when it names a `.credentials.json`, because only then can
+    /// Claude Code be using the same file. `None` for Claude Desktop, which
+    /// has its own lock.
+    pub fn claude_code_dir(&self) -> Option<PathBuf> {
+        match self {
+            CredsTarget::Explicit(path)
+                if path.file_name() != Some(std::ffi::OsStr::new(CREDENTIALS_FILE_NAME)) =>
+            {
+                None
+            }
+            CredsTarget::Desktop(_) => None,
+            _ => self.config_dir(),
+        }
     }
 }
 
@@ -345,20 +365,54 @@ fn merge_oauth(existing: Option<&str>, new_oauth: &OauthCreds) -> Result<serde_j
     Ok(doc)
 }
 
-/// Persist updated credentials to the source they were actually read from
-/// (see [`CredsSource`]), preserving any unknown top-level fields the Claude
-/// CLI might have added. Following the read source keeps a single shared
-/// source of truth with Claude Code — refreshing Keychain-read tokens into a
-/// stale shadow file would rotate the refresh token out from under it.
-pub fn write_back_to(source: &CredsSource, new_oauth: &OauthCreds) -> Result<()> {
+/// What [`write_back_if_current`] did.
+#[derive(Debug)]
+pub enum WriteBack {
+    /// The refreshed credentials were saved.
+    Written,
+    /// The store already holds a different refresh token, so another program
+    /// (Claude Code, or a second ai-usagebar) refreshed first. Nothing was
+    /// written; these are the credentials that are now current.
+    Superseded(OauthCreds),
+}
+
+/// Persist refreshed credentials to the source they were read from (see
+/// [`CredsSource`]), unless that source no longer holds `refreshed_from`, the
+/// refresh token the refresh spent. Overwriting a newer refresh token with
+/// ours would discard the login of whoever wrote it, which is how a refresh
+/// here could log Claude Code out. Unknown top-level fields the Claude CLI
+/// keeps in the document are preserved.
+///
+/// Following the read source keeps a single source of truth with Claude
+/// Code: refreshing Keychain-read tokens into a stale shadow file would
+/// rotate the refresh token out from under it. A Claude Desktop source is
+/// written unconditionally; its own lock already serialises it.
+pub fn write_back_if_current(
+    source: &CredsSource,
+    refreshed_from: &str,
+    new_oauth: &OauthCreds,
+) -> Result<WriteBack> {
     match source {
-        CredsSource::File(path) => write_back(path, new_oauth),
+        CredsSource::File(path) => {
+            let existing = std::fs::read_to_string(path).ok();
+            if let Some(current) = superseding(existing.as_deref(), refreshed_from) {
+                return Ok(WriteBack::Superseded(current));
+            }
+            let doc = merge_oauth(existing.as_deref(), new_oauth)?;
+            let bytes = serde_json::to_vec_pretty(&doc).map_err(AppError::Json)?;
+            atomic_write(path, &bytes)?;
+            Ok(WriteBack::Written)
+        }
         #[cfg(target_os = "macos")]
         CredsSource::Keychain => {
             let existing = keychain::read_raw()?;
+            if let Some(current) = superseding(existing.as_deref(), refreshed_from) {
+                return Ok(WriteBack::Superseded(current));
+            }
             let doc = merge_oauth(existing.as_deref(), new_oauth)?;
             let json = serde_json::to_string(&doc).map_err(AppError::Json)?;
-            keychain::write_raw(&json)
+            keychain::write_raw(&json)?;
+            Ok(WriteBack::Written)
         }
         #[cfg(not(target_os = "macos"))]
         CredsSource::Keychain => Err(AppError::Other(
@@ -367,16 +421,34 @@ pub fn write_back_to(source: &CredsSource, new_oauth: &OauthCreds) -> Result<()>
         #[cfg(target_os = "macos")]
         CredsSource::NamedKeychain(config_dir) => {
             let existing = keychain::read_raw_for(config_dir)?;
+            if let Some(current) = superseding(existing.as_deref(), refreshed_from) {
+                return Ok(WriteBack::Superseded(current));
+            }
             let doc = merge_oauth(existing.as_deref(), new_oauth)?;
             let json = serde_json::to_string(&doc).map_err(AppError::Json)?;
-            keychain::write_raw_for(config_dir, &json)
+            keychain::write_raw_for(config_dir, &json)?;
+            Ok(WriteBack::Written)
         }
         #[cfg(not(target_os = "macos"))]
         CredsSource::NamedKeychain(_) => Err(AppError::Other(
             "Keychain credentials source is macOS-only".into(),
         )),
-        CredsSource::Desktop(writeback) => writeback.write(new_oauth),
+        CredsSource::Desktop(writeback) => {
+            writeback.write(new_oauth)?;
+            Ok(WriteBack::Written)
+        }
     }
+}
+
+/// The credentials in `existing` when they carry a usable refresh token other
+/// than `refreshed_from`. A document that is missing, unparsable or signed
+/// out supersedes nothing, so the refreshed credentials are written over it.
+fn superseding(existing: Option<&str>, refreshed_from: &str) -> Option<OauthCreds> {
+    let current = serde_json::from_str::<CredentialsFile>(existing?)
+        .ok()?
+        .claude_ai_oauth;
+    (super::oauth::can_refresh(&current.refresh_token) && current.refresh_token != refreshed_from)
+        .then_some(current)
 }
 
 /// Persist updated credentials to a file, preserving unknown top-level fields.
@@ -826,5 +898,76 @@ mod tests {
         // A bare relative file name has an empty parent, which is no directory.
         let bare = CredsTarget::Explicit(PathBuf::from("credentials.json"));
         assert_eq!(bare.config_dir(), None);
+
+        // Claude Code's refresh lock lives in the same directory, but only a
+        // file named `.credentials.json` can be one Claude Code refreshes.
+        assert_eq!(
+            named.claude_code_dir(),
+            Some(PathBuf::from("/home/u/.claude-work"))
+        );
+        assert_eq!(
+            default.claude_code_dir(),
+            Some(PathBuf::from("/home/u/.claude"))
+        );
+        assert_eq!(
+            explicit.claude_code_dir(),
+            Some(PathBuf::from("/srv/claude"))
+        );
+        let hand_made = CredsTarget::Explicit(PathBuf::from("/srv/claude/work.json"));
+        assert_eq!(hand_made.claude_code_dir(), None);
+    }
+
+    /// A refresh must not overwrite a refresh token that another program
+    /// saved after this one read the file: that token is the other
+    /// program's login.
+    #[test]
+    fn a_conditional_write_back_leaves_a_newer_login_in_place() {
+        let login = |refresh_token: &str| {
+            format!(
+                r#"{{"claudeAiOauth":{{
+                    "accessToken":"AT","refreshToken":"{refresh_token}","expiresAt": 1,
+                    "subscriptionType":"pro","rateLimitTier":""
+                }},"mcpOAuth":"keep me"}}"#
+            )
+        };
+        let refreshed = OauthCreds {
+            access_token: "NEW".into(),
+            refresh_token: "NEW_RT".into(),
+            expires_at_ms: 1234,
+            subscription_type: "pro".into(),
+            rate_limit_tier: "".into(),
+            scopes: None,
+        };
+
+        let (_dir, path) = write_creds_closed(&login("SOMEONE_ELSES_RT"));
+        let source = CredsSource::File(path.clone());
+        match write_back_if_current(&source, "OLD_RT", &refreshed).unwrap() {
+            WriteBack::Superseded(current) => assert_eq!(current.refresh_token, "SOMEONE_ELSES_RT"),
+            WriteBack::Written => panic!("overwrote a newer login"),
+        }
+        assert_eq!(
+            read_from(&path).unwrap().claude_ai_oauth.refresh_token,
+            "SOMEONE_ELSES_RT"
+        );
+
+        // Still holding the token the refresh spent: the refresh is saved.
+        let (_dir, path) = write_creds_closed(&login("OLD_RT"));
+        let source = CredsSource::File(path.clone());
+        assert!(matches!(
+            write_back_if_current(&source, "OLD_RT", &refreshed).unwrap(),
+            WriteBack::Written
+        ));
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["claudeAiOauth"]["refreshToken"], "NEW_RT");
+        assert_eq!(raw["mcpOAuth"], "keep me");
+
+        // A signed-out file supersedes nothing.
+        let (_dir, path) = write_creds_closed(&login(""));
+        let source = CredsSource::File(path.clone());
+        assert!(matches!(
+            write_back_if_current(&source, "OLD_RT", &refreshed).unwrap(),
+            WriteBack::Written
+        ));
     }
 }

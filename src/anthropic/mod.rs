@@ -11,6 +11,7 @@ pub mod fetch;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod oauth;
+pub mod refresh_lock;
 pub mod types;
 
 pub use fetch::{FetchOutcome, fetch_snapshot};

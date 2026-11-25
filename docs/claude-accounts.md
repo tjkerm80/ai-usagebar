@@ -141,6 +141,13 @@ Keep these rules in mind:
   Refreshes are written back to that file.
 - Never run two clients against copies of the same refresh token. Token
   rotation will eventually strand one copy.
+- Claude Code and ai-usagebar may refresh the *same* file. ai-usagebar takes
+  Claude Code's own refresh lock (`.oauth_refresh.lock` in the file's
+  directory) first, reads the file again under it, and skips its refresh when
+  Claude Code has already refreshed. When it saves, it leaves a newer login
+  in place instead of overwriting it. This needs the file to be named
+  `.credentials.json`, the name Claude Code uses; a file under another name
+  is refreshed without the lock.
 - Keep credential files at mode `600`.
 - Give each module a separate `--cache-dir`.
 - `--creds-path` is Claude-only. For API-key providers, use a wrapper that
@@ -149,13 +156,14 @@ Keep these rules in mind:
 On macOS, prefer `accounts_dir`; scoped Keychain items avoid copied credential
 files entirely.
 
-## Switch the active account on macOS
+## Switch the active account
 
-Usage reporting and the active login are separate. macOS has two independent
+Usage reporting and the active login are separate. There are two independent
 Claude identities:
 
-- Claude Desktop, signed in through its own `config.json`;
-- the `claude` CLI, whose default login lives in the login Keychain.
+- Claude Desktop (macOS only), signed in through its own `config.json`;
+- the `claude` CLI, whose default login lives in the login Keychain on macOS
+  and in `~/.claude/.credentials.json` on Linux and Windows.
 
 Use the same label for both if they belong to the same account:
 
@@ -170,7 +178,8 @@ ai-usagebar account switch work --cli
 ```
 
 Without `--desktop` or `--cli`, `switch` handles both identities. If a label
-exists on only one side, the missing side is skipped.
+exists on only one side, the missing side is skipped. On Linux and Windows,
+where there is no Claude Desktop to switch, that leaves the CLI.
 
 ### Capture a Desktop account
 
@@ -210,7 +219,16 @@ credential under its account, then moves the target credential into the
 default slot and empties the target's own slot. ai-usagebar reads an active
 account from that default slot while its own slot is empty, which is exactly
 what the switch leaves behind, so a rotating refresh token is never live in
-two places.
+two places. On Linux and Windows an account's own slot is the
+`.credentials.json` in its directory, the file `CLAUDE_CONFIG_DIR=<dir> claude`
+uses.
+
+Running `claude` sessions follow the switch: Claude Code reloads its credential
+when the default slot changes, the same way it picks up a `/login` from another
+session. The switch holds Claude Code's token refresh lock
+(`.oauth_refresh.lock`) on every directory whose credential it moves, so a
+refresh in Claude Code waits for the switch instead of saving a token into a
+slot the switch has just emptied.
 
 A `CLAUDE_CONFIG_DIR` layout is the other case. There every directory keeps its
 own live login, and two of them can hold the *same* account, which is what the

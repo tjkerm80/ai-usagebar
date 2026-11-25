@@ -5,12 +5,15 @@
 //! [`crate::claude_desktop`]) — the two drift apart constantly, which is most
 //! of why they are both worth reporting.
 //!
-//! The CLI keeps exactly **one** default login: `~/.claude/.credentials.json`
-//! on Linux, the login-Keychain item `Claude Code-credentials` on macOS. A
-//! named account instead lives under its own `CLAUDE_CONFIG_DIR`, in the
-//! per-directory Keychain item [`crate::anthropic::keychain`] resolves. Making
-//! a named account "the one plain `claude` uses" therefore means moving its
-//! credential into that single default slot.
+//! The CLI keeps exactly **one** default login: the login-Keychain item
+//! `Claude Code-credentials` on macOS, `~/.claude/.credentials.json` on Linux
+//! and Windows. A named account instead lives under its own
+//! `CLAUDE_CONFIG_DIR`: in the per-directory Keychain item
+//! [`crate::anthropic::keychain`] resolves on macOS, in
+//! `<CLAUDE_CONFIG_DIR>/.credentials.json` elsewhere. Making a named account
+//! "the one plain `claude` uses" therefore means moving its credential into
+//! that single default slot. A running `claude` reloads its credential when
+//! the file's modification time changes, so open sessions follow the switch.
 //!
 //! Copying would leave both slots holding the same *rotating* refresh token,
 //! and whichever client refreshed first would invalidate the other — the
@@ -22,10 +25,16 @@
 //! whichever label is *currently* active to the default slot, so only one copy
 //! is ever live.
 //!
+//! The switch holds Claude Code's own token refresh lock
+//! ([`super::refresh_lock`]) for every directory whose credential it moves, so
+//! a refresh in Claude Code cannot save a token into a slot the switch has
+//! just emptied, or overwrite the login it has just installed.
+//!
 //! Everything except [`KeychainStore`] is platform-agnostic and unit-tested
-//! against a fake store, so the logic stays under CI's linter on Linux.
+//! against a fake store and [`FileStore`], so the logic stays under CI's
+//! linter on Linux.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -37,8 +46,8 @@ use crate::error::{AppError, Result};
 /// `oauthAccount` identity marker (uuid, email, org) — never a token.
 const CLAUDE_JSON: &str = ".claude.json";
 
-/// Read/write access to the credential slots. Abstracted so the switch logic
-/// can be tested without a macOS Keychain.
+/// Read/write access to the credential slots: [`KeychainStore`] on macOS,
+/// [`FileStore`] elsewhere. Use [`platform_store`] to get the right one.
 pub trait CredentialStore {
     fn read_default(&self) -> Result<Option<String>>;
     fn write_default(&self, blob: &str) -> Result<()>;
@@ -48,18 +57,70 @@ pub trait CredentialStore {
     fn delete_named(&self, config_dir: &Path) -> Result<()>;
 }
 
-/// The real store. The `#[cfg]` pairs are confined here so no other logic in
-/// this module is invisible to a Linux build — the same shape
-/// [`crate::anthropic::creds::resolve`] uses.
+/// The macOS store: the login-Keychain items `claude` itself uses.
+#[cfg(target_os = "macos")]
 pub struct KeychainStore;
 
+/// The Linux and Windows store: plain credential files. The default slot is
+/// `~/.claude/.credentials.json`, and a named slot is the `.credentials.json`
+/// inside the account's `CLAUDE_CONFIG_DIR`, the file
+/// `CLAUDE_CONFIG_DIR=<dir> claude` reads and writes.
+pub struct FileStore {
+    default_path: PathBuf,
+}
+
+impl FileStore {
+    /// A store whose default slot is the file at `default_path`.
+    pub fn at(default_path: PathBuf) -> Self {
+        Self { default_path }
+    }
+
+    fn named_path(config_dir: &Path) -> PathBuf {
+        config_dir.join(super::creds::CREDENTIALS_FILE_NAME)
+    }
+}
+
+/// The store that holds this platform's `claude` logins.
+pub fn platform_store() -> Result<Box<dyn CredentialStore>> {
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(KeychainStore));
+    #[cfg(not(target_os = "macos"))]
+    Ok(Box::new(FileStore::at(super::creds::default_path()?)))
+}
+
+/// The directory plain `claude` keeps its state in when no
+/// `CLAUDE_CONFIG_DIR` is set: `~/.claude`, the sibling of `~/.claude.json`.
+fn default_claude_dir(home_claude_json: &Path) -> PathBuf {
+    home_claude_json
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".claude")
+}
+
+/// Claude Code's refresh lock for each of `dirs`, taken in order. A directory
+/// listed twice, such as an account configured at `~/.claude` itself, is
+/// locked once; taking its lock a second time would wait on ourselves.
+fn lock_refreshes(dirs: &[PathBuf]) -> Result<Vec<super::refresh_lock::RefreshLock>> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut locks = Vec::new();
+    for dir in dirs {
+        let identity = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if seen.contains(&identity) {
+            continue;
+        }
+        seen.push(identity);
+        locks.push(super::refresh_lock::acquire_blocking(dir)?);
+    }
+    Ok(locks)
+}
+
 /// Path to the home `.claude.json` that records the live CLI identity.
-pub fn home_claude_json() -> Result<std::path::PathBuf> {
+pub fn home_claude_json() -> Result<PathBuf> {
     Ok(crate::cache::home_dir()?.join(CLAUDE_JSON))
 }
 
 /// The identity marker inside an account's own `CLAUDE_CONFIG_DIR`.
-pub fn marker_path(config_dir: &Path) -> std::path::PathBuf {
+pub fn marker_path(config_dir: &Path) -> PathBuf {
     config_dir.join(CLAUDE_JSON)
 }
 
@@ -188,6 +249,16 @@ pub fn switch_cli_account(
         })?;
 
     let active = resolve_active_label(home_claude_json, accounts);
+    let outgoing_account = active
+        .as_deref()
+        .and_then(|outgoing| accounts.iter().find(|account| account.label == outgoing));
+
+    // Every credential read below happens under Claude Code's refresh lock,
+    // so what is captured and moved is the current token, not one a refresh
+    // is about to replace.
+    let mut refresh_dirs = vec![default_claude_dir(home_claude_json), target.config_dir()];
+    refresh_dirs.extend(outgoing_account.map(AnthropicAccount::config_dir));
+    let _refresh_locks = lock_refreshes(&refresh_dirs)?;
 
     // Read every piece needed for both the move and its rollback before the
     // first write. An empty default slot is safe to populate without --force;
@@ -232,9 +303,6 @@ pub fn switch_cli_account(
         Some(&oauth_account),
     )?;
 
-    let outgoing_account = active
-        .as_deref()
-        .and_then(|outgoing| accounts.iter().find(|account| account.label == outgoing));
     let original_outgoing_named = match outgoing_account {
         Some(account) => store.read_named(&account.config_dir())?,
         None => None,
@@ -392,14 +460,9 @@ fn restore_named(store: &dyn CredentialStore, path: &Path, original: Option<&str
 }
 
 fn restore_marker(path: &Path, original: Option<&[u8]>) -> Result<()> {
-    if let Some(bytes) = original {
-        crate::cache::atomic_write(path, bytes)
-    } else {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(AppError::io_at(path, error)),
-        }
+    match original {
+        Some(bytes) => crate::cache::atomic_write(path, bytes),
+        None => remove_if_present(path),
     }
 }
 
@@ -429,68 +492,72 @@ fn oauth_account_in(claude_json: &Path) -> Option<Value> {
         .cloned()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn unsupported() -> AppError {
-    AppError::Credentials(
-        "switching the `claude` CLI login is supported on macOS only (elsewhere, run \
-         `CLAUDE_CONFIG_DIR=<account dir> claude` to use a specific account)"
-            .into(),
-    )
-}
-
+#[cfg(target_os = "macos")]
 impl CredentialStore for KeychainStore {
     fn read_default(&self) -> Result<Option<String>> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::read_raw();
-        #[cfg(not(target_os = "macos"))]
-        Err(unsupported())
+        super::keychain::read_raw()
     }
 
     fn write_default(&self, blob: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::write_raw(blob);
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = blob;
-            Err(unsupported())
-        }
+        super::keychain::write_raw(blob)
     }
 
     fn delete_default(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::delete_raw();
-        #[cfg(not(target_os = "macos"))]
-        Err(unsupported())
+        super::keychain::delete_raw()
     }
 
     fn read_named(&self, config_dir: &Path) -> Result<Option<String>> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::read_raw_for(config_dir);
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = config_dir;
-            Err(unsupported())
-        }
+        super::keychain::read_raw_for(config_dir)
     }
 
     fn write_named(&self, config_dir: &Path, blob: &str) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::write_raw_for(config_dir, blob);
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (config_dir, blob);
-            Err(unsupported())
-        }
+        super::keychain::write_raw_for(config_dir, blob)
     }
 
     fn delete_named(&self, config_dir: &Path) -> Result<()> {
-        #[cfg(target_os = "macos")]
-        return super::keychain::delete_raw_for(config_dir);
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = config_dir;
-            Err(unsupported())
-        }
+        super::keychain::delete_raw_for(config_dir)
+    }
+}
+
+impl CredentialStore for FileStore {
+    fn read_default(&self) -> Result<Option<String>> {
+        read_text(&self.default_path)
+    }
+
+    fn write_default(&self, blob: &str) -> Result<()> {
+        crate::cache::atomic_write(&self.default_path, blob.as_bytes())
+    }
+
+    fn delete_default(&self) -> Result<()> {
+        remove_if_present(&self.default_path)
+    }
+
+    fn read_named(&self, config_dir: &Path) -> Result<Option<String>> {
+        read_text(&Self::named_path(config_dir))
+    }
+
+    fn write_named(&self, config_dir: &Path, blob: &str) -> Result<()> {
+        crate::cache::atomic_write(&Self::named_path(config_dir), blob.as_bytes())
+    }
+
+    fn delete_named(&self, config_dir: &Path) -> Result<()> {
+        remove_if_present(&Self::named_path(config_dir))
+    }
+}
+
+fn read_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::io_at(path, error)),
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::io_at(path, error)),
     }
 }
 
@@ -506,6 +573,22 @@ mod tests {
         default: RefCell<Option<String>>,
         named: RefCell<BTreeMap<PathBuf, String>>,
         fail_delete_named: RefCell<Option<PathBuf>>,
+        /// Directories whose Claude Code refresh lock existed when the default
+        /// slot was written.
+        locked_at_default_write: RefCell<Vec<PathBuf>>,
+    }
+
+    impl FakeStore {
+        fn note_held_locks(&self) {
+            let held = self
+                .named
+                .borrow()
+                .keys()
+                .filter(|dir| super::super::refresh_lock::primary_lock_dir(dir).is_dir())
+                .cloned()
+                .collect();
+            *self.locked_at_default_write.borrow_mut() = held;
+        }
     }
 
     impl CredentialStore for FakeStore {
@@ -513,6 +596,7 @@ mod tests {
             Ok(self.default.borrow().clone())
         }
         fn write_default(&self, blob: &str) -> Result<()> {
+            self.note_held_locks();
             *self.default.borrow_mut() = Some(blob.to_string());
             Ok(())
         }
@@ -716,6 +800,84 @@ mod tests {
             resolve_active_label(&f.home, &f.accounts).as_deref(),
             Some("work")
         );
+        // Both accounts' credentials moved while Claude Code's refresh lock
+        // was held on their directories, and the locks are released after.
+        // The fake store lists its slots in path order: personal, then work.
+        assert_eq!(
+            *f.store.locked_at_default_write.borrow(),
+            vec![f.accounts[1].config_dir(), f.accounts[0].config_dir()]
+        );
+        for account in &f.accounts {
+            assert!(!super::super::refresh_lock::primary_lock_dir(&account.config_dir()).exists());
+        }
+    }
+
+    #[test]
+    fn a_file_store_switch_moves_the_credential_files() {
+        let f = fixture();
+        let default_path = f
+            .home
+            .parent()
+            .unwrap()
+            .join(".claude")
+            .join(".credentials.json");
+        write(&default_path, "personal-live");
+        write(&f.accounts[0].credentials_path, "work-saved");
+        let store = FileStore::at(default_path.clone());
+
+        let outcome = switch_cli_account(
+            &f.home,
+            &f.accounts,
+            "work",
+            CliSwitchOpts::default(),
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            CliSwitchOutcome::Switched {
+                outgoing: Some("personal".into())
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&default_path).unwrap(),
+            "work-saved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f.accounts[1].credentials_path).unwrap(),
+            "personal-live"
+        );
+        assert!(!f.accounts[0].credentials_path.exists());
+        assert!(
+            !super::super::refresh_lock::primary_lock_dir(default_path.parent().unwrap()).exists()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&default_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "a credential file must not be group or world readable"
+            );
+        }
+
+        // Deleting an absent slot is not an error, so a rollback can always run.
+        store.delete_named(&f.accounts[0].config_dir()).unwrap();
+        assert_eq!(store.read_named(&f.accounts[0].config_dir()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_directory_listed_twice_is_locked_once() {
+        let root = tempfile::TempDir::new().unwrap();
+        let dir = root.path().join(".claude");
+        std::fs::create_dir(&dir).unwrap();
+        let locks = lock_refreshes(&[dir.clone(), dir.join("."), dir.clone()]).unwrap();
+        assert_eq!(locks.len(), 1);
     }
 
     #[test]

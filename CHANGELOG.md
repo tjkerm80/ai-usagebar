@@ -1,5 +1,31 @@
 ## [Unreleased]
 
+### Added
+
+- **`account switch --cli` on Linux and Windows.** The switch moves the target
+  account's `<CLAUDE_CONFIG_DIR>/.credentials.json` into
+  `~/.claude/.credentials.json` after saving the outgoing login back into its
+  own account's file, the same move it already made between Keychain items on
+  macOS. Running `claude` sessions reload the default file when it changes, so
+  they follow the switch. `account add --adopt-current` works there too.
+
+### Fixed
+
+- **ai-usagebar no longer races Claude Code to refresh the same Claude
+  login.** Both rotate the same refresh token, so when both refreshed at once
+  one of them spent a token the other had already replaced, and whichever
+  saved last could leave Claude Code signed out. ai-usagebar now takes Claude
+  Code's own refresh locks (`<claude dir>/.oauth_refresh.lock` and the older
+  `<claude dir>.lock`), reads the credential again under them, and skips its
+  refresh when Claude Code has already refreshed. Its save leaves a login that
+  changed during the refresh in place. `account switch --cli` holds the same
+  lock on every directory whose credential it moves.
+- **A Kimi lock left behind by a killed process no longer blocks kimi-code.**
+  The lock directory held ai-usagebar's owner marker, and kimi-code removes
+  an abandoned lock with `rmdir`, which fails on a directory that is not
+  empty. Ownership is now recognised by the directory's modification time and
+  inode, so the directory stays empty (#495's protection is unchanged).
+
 ## [1.55.0] — 2026-11-24
 
 ### Added

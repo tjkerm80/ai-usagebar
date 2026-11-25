@@ -10,9 +10,9 @@ use crate::cache::{Cache, LockGuard, acquire_lock_async};
 use crate::error::{AppError, Result};
 use crate::usage::AnthropicSnapshot;
 
-use super::creds::{self, OauthCreds};
-use super::oauth;
+use super::creds::{self, OauthCreds, WriteBack};
 use super::types::UsageResponse;
+use super::{oauth, refresh_lock};
 
 /// `cedar_ember=1` asks the endpoint to also compute the banked-reset block.
 /// It is additive — `five_hour`, `seven_day`, `limits[]`, `extra_usage` and
@@ -82,7 +82,7 @@ pub async fn fetch_snapshot(
     // plan label though, so read them either way. `resolve` also reports where
     // the creds actually came from (file vs macOS Keychain) so the refresh
     // write-back follows the same source instead of forking a stale copy.
-    let (mut creds, creds_source) = creds::resolve(creds_target)?;
+    let (mut creds, mut creds_source) = creds::resolve(creds_target)?;
     let plan_label = creds.claude_ai_oauth.plan_label();
 
     // Corrupt fresh cache falls through to a live fetch rather than returning
@@ -95,7 +95,31 @@ pub async fn fetch_snapshot(
 
     // Maybe refresh.
     let now = Utc::now().timestamp();
-    let stale_token = oauth::needs_refresh(creds.claude_ai_oauth.expires_at_secs(), now);
+    let mut stale_token = oauth::needs_refresh(creds.claude_ai_oauth.expires_at_secs(), now);
+    // Claude Code refreshes this same rotating token. Take its own refresh
+    // lock so the two never refresh at once, then read the credentials again:
+    // Claude Code may have refreshed while this process waited, and its new
+    // token makes a refresh here unnecessary.
+    let mut refresh_lock = None;
+    if stale_token
+        && oauth::can_refresh(&creds.claude_ai_oauth.refresh_token)
+        && let Some(claude_dir) = creds_target.claude_code_dir()
+    {
+        match refresh_lock::acquire(&claude_dir).await {
+            Ok(lock) => refresh_lock = Some(lock),
+            Err(_) => {
+                return with_oauth_plan(
+                    &plan_label,
+                    handle_auth_failure(cache, plan_label.clone(), true),
+                );
+            }
+        }
+        (creds, creds_source) = creds::resolve(creds_target)?;
+        stale_token = oauth::needs_refresh(
+            creds.claude_ai_oauth.expires_at_secs(),
+            Utc::now().timestamp(),
+        );
+    }
     let have_refresh = oauth::can_refresh(&creds.claude_ai_oauth.refresh_token);
     if stale_token && !have_refresh {
         // No refresh token to refresh with — the Claude Code client owns token
@@ -107,13 +131,10 @@ pub async fn fetch_snapshot(
         // back to cache.
         cache.clear_last_error();
     } else if stale_token {
+        let refreshed_from = creds.claude_ai_oauth.refresh_token.clone();
         match tokio::time::timeout(
             REFRESH_TIMEOUT,
-            oauth::refresh(
-                client,
-                &endpoints.token,
-                &creds.claude_ai_oauth.refresh_token,
-            ),
+            oauth::refresh(client, &endpoints.token, &refreshed_from),
         )
         .await
         {
@@ -130,20 +151,30 @@ pub async fn fetch_snapshot(
                 }
                 creds.claude_ai_oauth.expires_at_ms =
                     Utc::now().timestamp_millis() + (rr.expires_in as i64) * 1000;
-                // When only the access token changed, a failed write loses
-                // nothing — the next run just refreshes again — so carry on.
-                if let Err(e) = creds::write_back_to(&creds_source, &creds.claude_ai_oauth)
-                    && rotated
-                {
-                    let msg = format!(
-                        "refreshed token could not be saved ({e}); the rotated \
-                         refresh token is lost — re-run `claude` to log in again"
-                    );
-                    cache.write_last_error(0, &msg);
-                    return with_oauth_plan(
-                        &plan_label,
-                        handle_auth_failure(cache, plan_label.clone(), false),
-                    );
+                match creds::write_back_if_current(
+                    &creds_source,
+                    &refreshed_from,
+                    &creds.claude_ai_oauth,
+                ) {
+                    Ok(WriteBack::Written) => {}
+                    // Another program refreshed first and saved its token.
+                    // That token is the login it now depends on, so use it and
+                    // leave it in place rather than replace it with ours.
+                    Ok(WriteBack::Superseded(current)) => creds.claude_ai_oauth = current,
+                    // When only the access token changed, a failed write loses
+                    // nothing — the next run just refreshes again — so carry on.
+                    Err(_) if !rotated => {}
+                    Err(e) => {
+                        let msg = format!(
+                            "refreshed token could not be saved ({e}); the rotated \
+                             refresh token is lost — re-run `claude` to log in again"
+                        );
+                        cache.write_last_error(0, &msg);
+                        return with_oauth_plan(
+                            &plan_label,
+                            handle_auth_failure(cache, plan_label.clone(), false),
+                        );
+                    }
                 }
             }
             Ok(Err(AppError::Http { status, .. }))
@@ -190,7 +221,9 @@ pub async fn fetch_snapshot(
     }
 
     // Usage fetches do not mutate credentials and should not make an account
-    // switch wait on the network once refresh/write-back is complete.
+    // switch, or Claude Code's own refresh, wait on the network once
+    // refresh/write-back is complete.
+    drop(refresh_lock);
     drop(credential_lock);
 
     // A blank access token is a signed-out credentials file, never a rate
@@ -432,6 +465,146 @@ mod tests {
         let cache = Cache::at(td.path().join("anthropic"));
         cache.ensure_dir().unwrap();
         (td, cache)
+    }
+
+    const USAGE_BODY: &str = r#"{"five_hour":{"utilization":50,"resets_at":"2026-05-23T17:30:00Z"},
+        "seven_day":{"utilization":25,"resets_at":"2026-05-30T12:00:00Z"}}"#;
+
+    /// A Claude Code config directory (`<root>/.claude`) holding a login, so
+    /// both of Claude Code's refresh locks land inside the temp root.
+    fn claude_dir_login(
+        root: &TempDir,
+        access_token: &str,
+        refresh_token: &str,
+        expires_ms: i64,
+    ) -> std::path::PathBuf {
+        let claude_dir = root.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join(".credentials.json");
+        write_login(&path, access_token, refresh_token, expires_ms);
+        path
+    }
+
+    fn write_login(
+        path: &std::path::Path,
+        access_token: &str,
+        refresh_token: &str,
+        expires_ms: i64,
+    ) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"claudeAiOauth":{{
+                    "accessToken":"{access_token}","refreshToken":"{refresh_token}",
+                    "expiresAt": {expires_ms},
+                    "subscriptionType":"max","rateLimitTier":"default_claude_max_5x"
+                }}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_saves_the_rotated_token_under_claude_codes_lock() {
+        let mut server = mockito::Server::new_async().await;
+        let token = server
+            .mock("POST", "/v1/oauth/token")
+            .with_status(200)
+            .with_body(r#"{"access_token":"NEW-AT","refresh_token":"NEW-RT","expires_in":3600}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .match_header("authorization", "Bearer NEW-AT")
+            .with_status(200)
+            .with_body(USAGE_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let root = TempDir::new().unwrap();
+        let expired = Utc::now().timestamp_millis() - 3_600_000;
+        let path = claude_dir_login(&root, "AT", "RT", expired);
+        let claude_dir = path.parent().unwrap().to_path_buf();
+        let (_td, cache) = cache_fixture();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+        fetch_snapshot(
+            &reqwest::Client::new(),
+            &creds::CredsTarget::Explicit(path.clone()),
+            &cache,
+            &endpoints,
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+        token.assert_async().await;
+        usage.assert_async().await;
+        let saved = creds::read_from(&path).unwrap().claude_ai_oauth;
+        assert_eq!(saved.refresh_token, "NEW-RT");
+        // Both of Claude Code's locks were released.
+        assert!(!refresh_lock::primary_lock_dir(&claude_dir).exists());
+        assert!(!refresh_lock::legacy_lock_dir(&claude_dir).unwrap().exists());
+    }
+
+    /// The race this lock exists for: Claude Code is refreshing when the
+    /// widget finds the token expired. The widget waits for Claude Code's
+    /// lock, reads the token Claude Code saved, and does not spend the old
+    /// refresh token a second time.
+    #[tokio::test]
+    async fn a_refresh_claude_code_finished_while_this_one_waited_is_not_repeated() {
+        let mut server = mockito::Server::new_async().await;
+        let token = server
+            .mock("POST", "/v1/oauth/token")
+            .with_status(200)
+            .with_body(r#"{"access_token":"X","refresh_token":"X","expires_in":3600}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let usage = server
+            .mock("GET", "/api/oauth/usage")
+            .match_header("authorization", "Bearer CLAUDE-CODE-AT")
+            .with_status(200)
+            .with_body(USAGE_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let root = TempDir::new().unwrap();
+        let expired = Utc::now().timestamp_millis() - 3_600_000;
+        let path = claude_dir_login(&root, "AT", "RT", expired);
+        let claude_dir = path.parent().unwrap().to_path_buf();
+        // Claude Code holds its refresh lock.
+        let held = refresh_lock::primary_lock_dir(&claude_dir);
+        std::fs::create_dir(&held).unwrap();
+
+        let (_td, cache) = cache_fixture();
+        let endpoints = Endpoints {
+            usage: format!("{}/api/oauth/usage", server.url()),
+            token: format!("{}/v1/oauth/token", server.url()),
+        };
+        let target = creds::CredsTarget::Explicit(path.clone());
+        let client = reqwest::Client::new();
+        let claude_code_refresh = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let fresh = Utc::now().timestamp_millis() + 3_600_000;
+            write_login(&path, "CLAUDE-CODE-AT", "CLAUDE-CODE-RT", fresh);
+            std::fs::remove_dir(&held).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            fetch_snapshot(&client, &target, &cache, &endpoints, Duration::from_secs(0)),
+            claude_code_refresh
+        );
+        outcome.unwrap();
+
+        token.assert_async().await;
+        usage.assert_async().await;
+        let saved = creds::read_from(&path).unwrap().claude_ai_oauth;
+        assert_eq!(saved.refresh_token, "CLAUDE-CODE-RT");
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ pub mod outcome;
 pub mod pacing;
 pub mod pango;
 pub mod process;
+pub mod proper_lockfile;
 pub mod report;
 pub mod safe_storage;
 pub mod serde_helpers;

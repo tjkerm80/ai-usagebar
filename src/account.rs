@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::anthropic::cli_account::{self, CliSwitchOpts, CliSwitchOutcome, KeychainStore};
+use crate::anthropic::cli_account::{self, CliSwitchOpts, CliSwitchOutcome};
 use crate::claude_desktop::{self, Paths, SwitchOpts, SwitchPlan};
 use crate::config::Config;
 use crate::display::{sanitize_untrusted_line, sanitize_untrusted_path};
@@ -1250,7 +1250,7 @@ fn switch_cli(config: &Config, args: &SwitchArgs, tolerant: bool) -> Result<bool
             force: args.force,
             dry_run: args.dry_run,
         },
-        &KeychainStore,
+        cli_account::platform_store()?.as_ref(),
     )?;
 
     println!("Claude Code      → {}", args.label);
@@ -1777,7 +1777,7 @@ fn adopt_claude(label: &str) -> i32 {
             &cli_account::home_claude_json()?,
             &accounts,
             account,
-            &KeychainStore,
+            cli_account::platform_store()?.as_ref(),
         )
     });
     match adopted {
