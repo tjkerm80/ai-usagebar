@@ -18,6 +18,13 @@
   It now moves only the keys Claude Code's own `/login` replaces: the login
   (`claudeAiOauth`) and the grants tied to it. Everything else stays in the
   default slot, on macOS as well as Linux and Windows.
+- **The default Claude entry and the active named account fetch once per
+  poll.** After `account switch --cli`, both entries read the same default
+  login but kept separate caches, so every poll requested the same usage
+  twice and the second request was often rate-limited (HTTP 429). The default
+  entry now reads through the active account's cache, so they share one
+  request, one rate-limit backoff and one notification. It also no longer
+  shows the previous account's usage after a switch.
 - **ai-usagebar no longer races Claude Code to refresh the same Claude
   login.** Both rotate the same refresh token, so when both refreshed at once
   one of them spent a token the other had already replaced, and whichever

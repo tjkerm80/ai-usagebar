@@ -70,7 +70,10 @@ Or use it in Waybar:
 
 Each named account gets its own cache under
 `~/.cache/ai-usagebar/anthropic/<label>/`. The default account keeps the
-original `~/.cache/ai-usagebar/anthropic/` path.
+original `~/.cache/ai-usagebar/anthropic/` path, except while its login is a
+named account's: after `account switch --cli` moves that account's login into
+the default slot, the default account reads through the named account's cache,
+so the two make one request per poll and share the rate-limit backoff.
 
 For Claude, `--account` cannot be combined with `--creds-path`. (OpenRouter
 also supports `--account` through its own account array.) An unknown label

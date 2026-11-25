@@ -1512,8 +1512,10 @@ fn vendor_cache(cli: &Cli, vendor: &str) -> Result<Cache> {
 /// Resolve the Anthropic credentials target + cache for this run, honoring
 /// `--account` (issue #14). `--cache-dir` still overrides the cache location;
 /// `--account <label>` selects a configured extra account (its credentials
-/// file and an `anthropic/<label>` cache subdir); with neither, the default
-/// account behaves byte-identically to before.
+/// file and an `anthropic/<label>` cache subdir). Without `--account`, the
+/// default entry reads the pre-#14 credentials, through the live named
+/// account's cache when the default login is that account's (see
+/// [`default_entry_cache`]).
 fn anthropic_target(cli: &Cli, config: &Config) -> Result<(CredsTarget, Cache)> {
     match cli.account.as_deref() {
         // `--account <label> --desktop`: read the Claude Desktop app's own token
@@ -1529,10 +1531,29 @@ fn anthropic_target(cli: &Cli, config: &Config) -> Result<(CredsTarget, Cache)> 
             Ok((target, cache))
         }
         Some(label) => named_account_target(cli, config, label),
-        None => Ok((
-            anthropic_default_creds(cli, config)?,
-            vendor_cache(cli, "anthropic")?,
-        )),
+        None => {
+            let creds = anthropic_default_creds(cli, config)?;
+            // Only the platform-default slot can hold a named account's login;
+            // `--creds-path` and config `credentials_path` are other files.
+            let shared_account = match creds {
+                CredsTarget::Default(_) => config.anthropic.default_entry_account(),
+                _ => None,
+            };
+            Ok((creds, default_entry_cache(cli, shared_account.as_deref())?))
+        }
+    }
+}
+
+/// The default entry's cache. When the default login belongs to the live named
+/// account (`shared_account`), that account's `anthropic/<label>` cache, so the
+/// default entry and `--account <label>` make one request per poll and share
+/// the 429 backoff; otherwise the `anthropic` cache. `--cache-dir` relocates
+/// either one.
+fn default_entry_cache(cli: &Cli, shared_account: Option<&str>) -> Result<Cache> {
+    match (cli.cache_dir.as_deref(), shared_account) {
+        (Some(p), Some(label)) => Ok(Cache::at(p.join("anthropic").join(label))),
+        (None, Some(label)) => Cache::for_vendor_account("anthropic", label),
+        (_, None) => vendor_cache(cli, "anthropic"),
     }
 }
 
@@ -1845,6 +1866,15 @@ mod tests {
             CredsTarget::Explicit(PathBuf::from("/tmp/creds.json"))
         );
         assert_eq!(cache.dir(), std::path::Path::new("/tmp/cache/anthropic"));
+
+        // When the default login is the live named account's, the default
+        // entry reads through that account's cache, so `--account work` and
+        // the default entry fetch once per poll and share the 429 backoff.
+        let shared = default_entry_cache(&cli, Some("work")).unwrap();
+        assert_eq!(
+            shared.dir(),
+            std::path::Path::new("/tmp/cache/anthropic/work")
+        );
     }
 
     #[test]

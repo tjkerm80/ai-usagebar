@@ -539,6 +539,61 @@ impl AnthropicConfig {
         }
     }
 
+    /// The credentials target + cache the default (unlabelled) Claude entry
+    /// fetches through: [`default_creds_target`] and, normally, the
+    /// `anthropic` cache. When [`default_entry_account`] names the account
+    /// that login belongs to, the entry uses that account's `anthropic/<label>`
+    /// cache instead. The two entries then read one credential through one
+    /// cache, so a poll makes one request, and they share the TTL and the 429
+    /// backoff.
+    ///
+    /// [`default_creds_target`]: AnthropicConfig::default_creds_target
+    /// [`default_entry_account`]: AnthropicConfig::default_entry_account
+    pub fn default_target(&self) -> Result<(CredsTarget, Cache)> {
+        let cache = match self.default_entry_account() {
+            Some(label) => Cache::for_vendor_account("anthropic", &label)?,
+            None => Cache::for_vendor("anthropic")?,
+        };
+        Ok((self.default_creds_target(), cache))
+    }
+
+    /// The configured account whose login the default entry reads, if any.
+    /// Reads `~/.claude.json` and probes the account's own slot, so tests use
+    /// [`default_entry_account_with`](AnthropicConfig::default_entry_account_with).
+    pub fn default_entry_account(&self) -> Option<String> {
+        if self.credentials_path.is_some() || self.all_accounts().is_empty() {
+            return None;
+        }
+        self.default_entry_account_with(
+            self.active_cli_label().as_deref(),
+            &CredentialProbes::system(),
+        )
+    }
+
+    /// The pure core of [`default_entry_account`]: the live CLI account, when
+    /// its named entry resolves to the default credential slot, which is the
+    /// slot the default entry reads. `None` when config sets
+    /// `credentials_path` (the default entry then reads that file, not the
+    /// slot), when no account is live, when the live account still holds its
+    /// own credential, or when probing its slot fails. A failed probe leaves
+    /// the default entry on its own cache; the named entry reports the error.
+    ///
+    /// [`default_entry_account`]: AnthropicConfig::default_entry_account
+    pub(crate) fn default_entry_account_with(
+        &self,
+        cli_active: Option<&str>,
+        probes: &CredentialProbes<'_>,
+    ) -> Option<String> {
+        if self.credentials_path.is_some() {
+            return None;
+        }
+        let label = cli_active?;
+        match self.account_creds_target(label, Some(label), probes) {
+            Ok(CredsTarget::Default(_)) => Some(label.to_string()),
+            _ => None,
+        }
+    }
+
     /// The pure half of [`account_target`](AnthropicConfig::account_target),
     /// with "which account the `claude` CLI is signed into" injected — the same
     /// shape as `Cli::resolve_vendor_with`. The cache depends on the label
@@ -6584,6 +6639,55 @@ api_key = "sk-ant-admin01-side"
             )
             .unwrap();
         assert!(matches!(before, CredsTarget::Default(_)), "{before:?}");
+    }
+
+    #[test]
+    fn the_default_entry_shares_the_cache_of_the_account_whose_login_it_reads() {
+        // The default entry and `anthropic@work` read the same default slot
+        // once `account switch` emptied work's own slot. Separate caches made
+        // every poll fetch twice, and the second request drew a 429.
+        let cfg = AnthropicConfig {
+            accounts: vec![AnthropicAccount {
+                label: "work".into(),
+                credentials_path: "/tmp/accounts/work/.credentials.json".into(),
+            }],
+            ..Default::default()
+        };
+        let emptied = |_: &AnthropicAccount| -> Result<bool> { Ok(false) };
+        assert_eq!(
+            cfg.default_entry_account_with(Some("work"), &probes(&emptied)),
+            Some("work".to_string())
+        );
+
+        // Work still holds its own credential: two logins, two caches.
+        let holds = |_: &AnthropicAccount| -> Result<bool> { Ok(true) };
+        assert_eq!(
+            cfg.default_entry_account_with(Some("work"), &probes(&holds)),
+            None
+        );
+        // No live account, or a slot that cannot be read.
+        assert_eq!(
+            cfg.default_entry_account_with(None, &probes(&emptied)),
+            None
+        );
+        let locked = |_: &AnthropicAccount| -> Result<bool> {
+            Err(AppError::Credentials("keychain locked".into()))
+        };
+        assert_eq!(
+            cfg.default_entry_account_with(Some("work"), &probes(&locked)),
+            None
+        );
+        // Config `credentials_path` points the default entry at another file.
+        let explicit = AnthropicConfig {
+            credentials_path: Some("/tmp/claude-home/.credentials.json".into()),
+            ..cfg
+        };
+        let not_probed =
+            |_: &AnthropicAccount| -> Result<bool> { panic!("an explicit path is never probed") };
+        assert_eq!(
+            explicit.default_entry_account_with(Some("work"), &probes(&not_probed)),
+            None
+        );
     }
 
     #[test]

@@ -786,18 +786,17 @@ async fn build_outcome(
             // A named account resolves to its own credential slot (file or
             // macOS Keychain item) + `anthropic/<label>` cache, shared with the
             // widget via `account_target` (#14/#17).
-            // The default tab keeps the pre-existing resolution: config
-            // `credentials_path` is an explicit strict read, and only the
-            // platform default gets the macOS Keychain fallback.
+            // The default tab: config `credentials_path` is an explicit strict
+            // read, and only the platform default gets the macOS Keychain
+            // fallback. When the default login belongs to the live named
+            // account, the tab shares that account's cache, so the two tabs
+            // make one request per poll (`default_target`).
             let (creds_target, cache) = match tab.account.as_deref() {
                 Some(label) if tab.desktop => {
                     crate::anthropic::desktop_creds::account_target(config, label)?
                 }
                 Some(label) => config.anthropic.account_target(label)?,
-                None => (
-                    config.anthropic.default_creds_target(),
-                    crate::cache::Cache::for_vendor("anthropic")?,
-                ),
+                None => config.anthropic.default_target()?,
             };
             let endpoints = crate::anthropic::fetch::Endpoints::default();
             let outcome =
